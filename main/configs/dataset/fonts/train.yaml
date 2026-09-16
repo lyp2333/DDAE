@@ -1,0 +1,148 @@
+# for joint training
+joint:
+  data:
+    root: "/home/lyp/Data/Fonts/fonts_128_group_20k.lmdb"
+    name: "fonts_128_group"
+    is_group_dataset: True
+    group_size: 6
+    image_size: 128
+    hflip: True
+    n_channels: 3
+    norm: True
+
+  model_ddpm:
+    dim: 128
+    emb_channels: 512 # should be same as encoder_out_channels
+    attn_resolutions: "16,32"
+    n_residual: 2
+    dim_mults: "1,1,2,3,4"
+    dropout: 0.1
+    n_heads: 4
+    num_head_channels: -1
+    beta1: 1e-4
+    beta2: 0.02
+    use_scale_shift_norm: True
+    n_timesteps: 1000
+    var_type: fixedlarge
+    use_z: True
+    z_dim: ${dataset.joint.model_Encoder.out_channels}
+    use_x_hat: False
+    resblock_updown: True
+    use_mappingnet: False
+
+  model_Encoder:
+    in_channels: 3
+    model_channels: ${dataset.joint.model_ddpm.dim}
+    out_channels: 512 # latent-code length, constant value = 512
+    num_res_blocks: 2
+    attention_resolutions: "16,32,64"
+    dropout: 0.1
+    channel_mult: "1,1,2,3,4,4"
+    conv_resample: True
+    use_checkpoint: False
+    num_heads: 4
+    num_head_channels: -1
+    resblock_updown: True
+
+  training:
+    seed: 42
+    is_group_training: ${dataset.joint.data.is_group_dataset}
+    training_name: "fonts_128-diffae-form1-GAE"
+    fp16: True
+    use_ema: True
+    use_z: ${dataset.joint.model_ddpm.use_z}
+    z_dim: ${dataset.joint.model_Encoder.out_channels}
+    type: 'form1'
+    ema_decay: 0.9999
+    batch_size: 10
+    epochs: 500
+    steps: 600_000
+    log_step: 1
+    device: "gpu:0"
+    chkpt_interval: 1500
+    optimizer: "Adam"
+    training_lr: 2e-5
+    weight_decay: 0
+    beta_1: 0.9
+    beta_2: 0.999
+    restore_path: ""
+    results_dir: "/home/lyp/Code/DiffuseGAE"
+    workers: 72
+    grad_clip: 1.0
+    lr_scheduler: 'warmup'
+    warmup: 0
+    loss: "l2"
+    chkpt_prefix: ""
+    cfd_rate: 0.0
+    # joint_train params
+    train_pattern: 'encoder+GAE+ddpm'
+    gamma: 1 # loss weight
+    Gae_chkpt_path: '/home/lyp/Code/DiffuseGAE/checkpoints/fonts_128-l1-norm_True-500k-new_GAE-training--checkpoints/Model_weights/last.ckpt' #
+    diffae_chkpt_path: "/home/lyp/Code/DiffuseGAE/checkpoints/fonts_128-diffae-form1--checkpoints/Model_weights/last.ckpt"
+    # log samples paras
+    sample_every_step: 2000
+    num_samples: 24
+    sample_storage_path: ""
+    samples_norm: False
+    sample_from: 'target'
+    resample_strategy: 'spaced'
+    skip_strategy: 'uniform'
+    sample_method: 'ddim'
+    pred_steps: 20
+
+# for GAE training
+GAE:
+  data:
+    root: /home/lyp/Data/Fonts/latent_code/group_latent_code-${dataset.GAE.data.name}.pth
+    name: "fonts_128_group_20k_z"
+    is_group_dataset: True
+    group_size: 6
+    image_size: 128
+    n_channels: 3
+    norm: True
+  model:
+    in_channels: ${dataset.joint.model_Encoder.out_channels}
+    base_dim: 512
+    num_skip_blocks: 4
+    out_channels: ${dataset.joint.model_Encoder.out_channels}
+    repeat_num: 2
+    dropout: 0.1
+    z_dim: 100
+    z_content_dim: 20
+    z_size_dim: 20
+    z_font_color_dim: 20
+    z_back_color_dim: 20
+    z_style_dim: 20
+    diffusion_ckpt_path: ${dataset.joint.training.results_dir}/checkpoints/${dataset.joint.training.training_name}--checkpoints/Model_weights/model_encoder+ddpm--epoch=0018-global_step=000000000-whole_loss=0.000160.ckpt
+  training:
+    seed: 42
+    is_group_training: ${dataset.joint.data.is_group_dataset}
+    training_name: fonts_128-${dataset.GAE.training.loss_type}-norm_${dataset.GAE.data.norm}-500k-new_GAE-training
+    fp16: False
+    batch_size: 4096
+    type: 'form1'
+    epochs: 400000
+    log_step: 40
+    device: "gpu:0"
+    chkpt_interval: 150
+    optimizer: "Adam"
+    training_lr: 1e-4
+    weight_decay: 0
+    beta_1: 0.9
+    beta_2: 0.999
+    restore_path: ""
+    results_dir: "/home/lyp/Code/DiffuseGAE"
+    workers: 128
+    lr_scheduler: 'warmup'
+    warmup: 0
+    loss_type: "l1"
+    chkpt_prefix: ""
+    cfd_rate: 0.0
+    lambda_recon: 1
+    lambda_combine: 0.5 # loss_Gae weight
+    lambda_unsup: 0.5 # loss_Gae weight
+    sample_every_step: 2000
+    num_samples: 16
+    sample_storage_path: ""
+    samples_norm: False
+

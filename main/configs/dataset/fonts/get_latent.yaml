@@ -1,0 +1,38 @@
+# joint training
+joint:
+  data:
+    root: "/home/lyp/Data/Fonts/fonts_20k_group.lmdb"
+    name: "fonts_128_group"
+    saved_name: "fonts_128_group_20k_z"
+    is_group_dataset: True
+    group_size: 6 # should be zero when is_group_dataset is false
+    image_size: 128
+    hflip: False
+    n_channels: 3
+    norm: True
+
+  model_Encoder: # should be same as the model used for training
+    in_channels: 3
+    model_channels: ${dataset.joint.model_ddpm.dim}
+    out_channels: 512 # latent-code length
+    num_res_blocks: 2
+    attention_resolutions: "16,"
+    dropout: 0.1
+    channel_mult: "1,1,2,3,4,4"
+    conv_resample: True
+    use_checkpoint: False
+    num_heads: 1
+    resblock_updown: True
+
+  model_ddpm:
+    dim: 128
+
+  training:
+    seed: 42
+    device: 'gpu:0'
+    mode: 'best' # best ckpt or last ckpt
+    training_name: "fonts_128-diffae-form1" # change to name you want to use ckpt in that training
+    results_dir: "/home/lyp/Code/DiffuseGAE"
+    batch_size: 128
+    workers: 96
+

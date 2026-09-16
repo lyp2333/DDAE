@@ -1,0 +1,366 @@
+import shutil
+
+import torch
+import os
+import sys
+import logging
+import copy
+import hydra
+import numpy as np
+from omegaconf import DictConfig, OmegaConf
+from matplotlib import pyplot as plt
+from functools import partial
+
+sys.path.append("/home/lyp/Code/DiffuseGAE")
+import torch
+from torch.utils.data import DataLoader
+from collections import defaultdict
+from tsne_torch import TorchTSNE as TSNE
+from main.models.diffusion import DDPM, Encoder, SuperResModel
+from main.models.autoencoders import GAE_PL
+from main.models.joint_model import ModelWrapper
+from main.util import configure_device, get_dataset, parse_str
+from lightning_fabric.utilities.seed import seed_everything
+
+from tqdm import tqdm
+from matplotlib.animation import FuncAnimation
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+def update(i, ax, anim_save_path):
+    label = 'timestep {0}'.format(i)
+    # 更新直线和x轴（用一个新的x轴的标签）。
+    # 用元组（Tuple）的形式返回在这一帧要被重新绘图的物体
+    horiAngle = (45 + 3 * i) % 360  # transition(i, 40)
+    vertAngle = (45 + 3 * i) % 360  # transition(i, 40)
+    print(label, horiAngle, vertAngle)
+    ax.view_init(vertAngle, horiAngle)
+    filename = f'{anim_save_path}/' + str('%03d' % i) + '.png'
+    plt.savefig(filename, dpi=600)
+    return ax
+
+
+def get_labels_index(labels_root):
+    with open(labels_root, 'r') as f:
+        lines = f.readlines()
+        idx = [int(i) for i in range(len(lines))]
+        labels = [lines[i].split(' ')[0] for i in idx]
+        id_labels = []
+        back_labels = []
+        pose_labels = []
+        for label in labels:
+            splited_label = label.split('-')
+            id_labels.append(splited_label[0])
+            back_labels.append(splited_label[2])
+            pose_labels.append(splited_label[3] + '-' + splited_label[4])
+    id_classes, back_classes, pose_classes = map(sorted, (set(id_labels), set(back_labels), set(pose_labels)))
+
+    logger.info(('id', len(id_classes), id_classes))
+    logger.info(('background', len(back_classes), back_classes))
+    logger.info(('pose', len(pose_classes), pose_classes))
+
+    id_classes2index = dict((classes, idx) for idx, classes in enumerate(id_classes))
+    back_classes2index = dict((classes, idx) for idx, classes in enumerate(back_classes))
+    pose_classes2index = dict((classes, idx) for idx, classes in enumerate(pose_classes))
+
+    id_index = [id_classes2index[key] for key in id_labels]
+    back_index = [back_classes2index[key] for key in back_labels]
+    pose_index = [pose_classes2index[key] for key in pose_labels]
+
+    return id_index, back_index, pose_index
+
+
+def get_eval_index(
+    labels_root,
+    label_list: list,
+    attribute='id',
+    dtype='ilab',
+    num_to_eval: int = 1000,
+):
+    if dtype == 'ilab':
+        attr2index = {
+            'id': 0,
+            'back': 1,
+            'pose': 2,
+        }
+    else:
+        raise NotImplementedError()
+    all_index = get_labels_index(labels_root)
+    index = all_index[attr2index[attribute]]
+
+    res = []
+    for i, label_i in enumerate(index):
+        if i >= num_to_eval:
+            break
+        if label_i in label_list:
+            res.append(i)
+    # res = defaultdict(int)
+    # for i, label_i in enumerate(index):
+    #     if i >= num_to_eval:
+    #         break
+    #     if label_i in label_list:
+    #         res[label_i] += 1
+    return res
+
+
+@hydra.main(config_path="../configs", config_name="default_conf.yaml")
+def visualize(config):
+    logger.info(OmegaConf.to_yaml(config, resolve=True))
+    config_joint = config.dataset.joint
+    config_GAE = config.dataset.GAE
+    # model_wrapper should have encoder+GAE+ddpm
+
+    # Set seed
+    seed_everything(config_joint.evaluation.seed)
+
+    # Dataset
+    root = config_joint.data.root
+    z_root = config_GAE.data.root  # latent data root
+    z_norm = config_GAE.data.norm
+
+    dev_ = configure_device(config_joint.evaluation.device)
+    dev = torch.device(f'cuda:{dev_[1][0]}') if isinstance(dev_, tuple) else torch.device(dev_)
+
+    d_type = config_joint.data.name
+    image_size = config_joint.data.image_size
+    is_group_dataset = config_joint.data.is_group_dataset
+    dataset = get_dataset(
+        d_type, root, image_size, norm=config_joint.data.norm, flip=False
+    )
+
+    if z_norm:
+        z_mean = get_dataset(config_GAE.data.name, z_root, config_GAE.data.image_size, norm=z_norm, flip=False).z_mean.to(dev)
+        z_std = get_dataset(config_GAE.data.name, z_root, config_GAE.data.image_size, norm=z_norm, flip=False).z_std.to(dev)
+    N = len(dataset)
+    batch_size = min(N, config_joint.evaluation.batch_size)
+
+    # Model
+    # eps predictor
+    attn_resolutions = parse_str(config_joint.model_ddpm.attn_resolutions)
+    dim_mults = parse_str(config_joint.model_ddpm.dim_mults)
+    decoder = SuperResModel(
+        in_channels=config_joint.data.n_channels,
+        model_channels=config_joint.model_ddpm.dim,
+        out_channels=3,
+        emb_channels=config_joint.model_ddpm.emb_channels,  # t_emb and z_emb(generated by AE)
+        num_res_blocks=config_joint.model_ddpm.n_residual,
+        attention_resolutions=attn_resolutions,
+        channel_mult=dim_mults,
+        use_checkpoint=False,
+        dropout=config_joint.model_ddpm.dropout,
+        num_heads=config_joint.model_ddpm.n_heads,
+        z_dim=config_joint.evaluation.z_dim,
+        use_scale_shift_norm=config_joint.model_ddpm.use_scale_shift_norm,
+        use_z=config_joint.model_ddpm.use_z,
+        use_x_hat=config_joint.model_ddpm.use_x_hat,
+        use_mappingnet=config_joint.model_ddpm.use_mappingnet
+    )
+    ema_decoder = copy.deepcopy(decoder)
+    decoder.eval()
+    ema_decoder.eval()
+
+    # base sampler(DDPM) settings
+    online_ddpm = DDPM(
+        decoder,
+        beta_1=config_joint.model_ddpm.beta1,
+        beta_2=config_joint.model_ddpm.beta2,
+        T=config_joint.model_ddpm.n_timesteps,
+        var_type=config_joint.evaluation.variance,
+    )
+    target_ddpm = DDPM(
+        ema_decoder,
+        beta_1=config_joint.model_ddpm.beta1,
+        beta_2=config_joint.model_ddpm.beta2,
+        T=config_joint.model_ddpm.n_timesteps,
+        var_type=config_joint.evaluation.variance,
+    )
+
+    # Encoder settings
+    config_model_encoder = config_joint.model_Encoder
+    attention_resolutions = parse_str(config_model_encoder.attention_resolutions)
+    channel_mult = parse_str(config_model_encoder.channel_mult)
+    encoder = Encoder(
+        in_channels=config_model_encoder.in_channels,
+        model_channels=config_model_encoder.model_channels,
+        out_channels=config_model_encoder.out_channels,
+        num_res_blocks=config_model_encoder.num_res_blocks,
+        attention_resolutions=attention_resolutions,
+        dropout=config_model_encoder.dropout,
+        channel_mult=channel_mult,
+        conv_resample=config_model_encoder.conv_resample,
+        use_checkpoint=config_model_encoder.use_checkpoint,
+        num_heads=config_model_encoder.num_heads,
+        resblock_updown=config_model_encoder.resblock_updown
+    )
+
+    # # GAE settings
+    # Gae_pl = GAE_PL(config_GAE)
+    # todo delete
+    Gae_pl = GAE_PL.load_from_checkpoint(config_GAE.model.ckpt_path, strict=False).to(dev)
+    dim_slice = []
+    if 'ilab' in d_type:
+        ATTRIBUTE = ['id', 'back', 'pose']
+        dim_slice = [slice(0, 60),
+                     slice(60, 80),
+                     slice(80, 100)]
+    elif 'fonts' in d_type:
+        for i in range(0, 100, 20):
+            dim_slice.append(slice(i, i + 20))
+    else:
+        raise NotImplementedError()
+
+    # get joint_model with models mentioned above from ckpt
+    joint_model = ModelWrapper.load_from_checkpoint(
+        config_joint.evaluation.ckpt_path,
+        strict=True,
+        online_network=online_ddpm,
+        target_network=target_ddpm,
+        encoder=encoder,
+        GAE_pl=Gae_pl,
+    )
+    joint_model.eval()
+    encoder = joint_model.encoder.to(dev)
+
+    # loader settings
+    loader_kws = {}
+    loader = DataLoader(
+        dataset,
+        batch_size,
+        num_workers=config_joint.evaluation.workers,
+        pin_memory=True,
+        shuffle=False,
+        drop_last=True,
+        **loader_kws,
+    )
+
+    # get group_truth in ilab_128
+    id_clabel, back_clabel, pose_clabel = get_labels_index(config_joint.data.labels_root)
+
+    # sample settings
+    num_samples = config_joint.evaluation.num_tsne_samples
+    save_path = config_joint.evaluation.visualization_save_path
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    total = 0
+    z_dis_all_attr = [[] for _ in range(len(dim_slice))]
+    visualization_type = config_joint.evaluation.visualization_type
+
+    prefix = config_joint.evaluation.visualization_save_prefix
+    savepath_2d = os.path.join(save_path, f'{prefix}-tsne-2d.pkl')
+    savepath_3d = os.path.join(save_path, f'{prefix}-tsne-3d.pkl')
+
+    # back_label_index = get_eval_index(
+    #     labels_root=config_joint.data.labels_root,
+    #     label_list=list(range(111)),
+    #     attribute='back',
+    #     dtype='ilab',
+    #     num_to_eval=1000,
+    # )
+    # print(back_label_index)
+    # print(sorted(back_label_index.keys(), key=lambda x: back_label_index[x]))
+
+    if not os.path.exists(savepath_2d) or not os.path.exists(savepath_3d):
+        with tqdm(total=num_samples * 5) as pbar:
+            with torch.no_grad():
+                for idx, batch in enumerate(loader):
+                    batch = batch.to(dev).flatten(0, 1) if is_group_dataset else batch.to(dev)
+                    z_original = encoder(batch)
+                    z_in_gae = (z_original - z_mean) / z_std if z_norm else z_original
+                    z_dis = Gae_pl.get_latent_code(z_in_gae)
+                    for i, val in enumerate(dim_slice):
+                        z_dis_all_attr[i].append(z_dis[:, dim_slice[i]] if visualization_type == 'z_dis' else z_original)  # 去掉norm的情况下，denormz_dis产看tSNE
+                    pbar.update(batch_size)
+                    total += batch_size
+                    if total >= num_samples * 5:
+                        break
+
+        # todo change
+
+        results2d = []
+        results3d = []
+
+        for i, attr_z in enumerate(z_dis_all_attr):
+            if i == 2:
+                break
+            elif i == 0:
+                matrix2d = TSNE(n_components=2, n_iter=4000, verbose=True, perplexity=40, initial_dims=1000).fit_transform(torch.cat(attr_z, dim=0)[:num_samples])
+                matrix3d = TSNE(n_components=3, n_iter=4000, verbose=True, perplexity=40, initial_dims=1000).fit_transform(torch.cat(attr_z, dim=0)[:num_samples])
+            else:
+                matrix2d = TSNE(n_components=2, n_iter=4000, verbose=True, perplexity=40, initial_dims=1000).fit_transform(torch.cat(attr_z, dim=0)[:num_samples * 5])
+                matrix3d = TSNE(n_components=3, n_iter=4000, verbose=True, perplexity=40, initial_dims=1000).fit_transform(torch.cat(attr_z, dim=0)[:num_samples * 5])
+            results2d.append(matrix2d)
+            results3d.append(matrix3d)
+        torch.save(results2d, savepath_2d)
+        torch.save(results3d, savepath_3d)
+    else:
+        results2d = torch.load(savepath_2d, map_location='cpu')
+        results3d = torch.load(savepath_3d, map_location='cpu')
+    id_label_index = get_eval_index(
+        labels_root=config_joint.data.labels_root,
+        label_list=[1, 3, 4, 6, 8, 9],
+        attribute='id',
+        dtype='ilab',
+        num_to_eval=num_samples,
+    )
+
+    back_label_index = get_eval_index(
+        labels_root=config_joint.data.labels_root,
+        label_list=[52, 0, 7, 100, 3, 31, 86, 101, 13, 27, 88, 62, 82, 108, 105, 80, 95, 1],
+        attribute='back',
+        dtype='ilab',
+        num_to_eval=num_samples * 5,
+    )
+
+    # visualization
+    # 2D
+    fig = plt.figure(figsize=(12, 12))
+    plt.axis('off')
+
+    plt.scatter(results2d[0][id_label_index, 0], results2d[0][id_label_index, 1], c=[id_clabel[i] for i in id_label_index], cmap='tab20')
+    plt.savefig(os.path.join(save_path, f'{prefix}-tsne-id.png'), dpi=600)
+    plt.clf()
+    plt.scatter(results2d[1][back_label_index, 0], results2d[1][back_label_index, 1], c=[back_clabel[i] for i in back_label_index], cmap='tab20')
+    plt.savefig(os.path.join(save_path, f'{prefix}-tsne-back.png'), dpi=600)
+    plt.clf()
+
+    print(results2d[0][id_label_index, 0].shape)
+    print(results2d[1][back_label_index, 0].shape)
+    logger.info('2d completed')
+    # first 20000 nums_samples have same pose, so we ignore pose visualization
+
+    # # 3D
+    # axe_3d = plt.axes(projection='3d')
+    # axe_3d.grid(False)
+    # anim_save_path = os.path.join(save_path, f'{prefix}-3d-tsne-id-animation'), os.path.join(save_path, f'{prefix}-3d-tsne-back-animation')
+    # for path in anim_save_path:
+    #     if os.path.exists(path):
+    #         shutil.rmtree(path)
+    #     else:
+    #         os.makedirs(path)
+    #
+    # # id
+    # anim_id = FuncAnimation(fig,
+    #                         partial(update, ax=axe_3d, anim_save_path=anim_save_path[0]),
+    #                         frames=np.arange(0, 120),
+    #                         interval=200,
+    #                         )
+    #
+    # axe_3d.scatter3D(results3d[0][:, 0][id_label_index], results3d[0][:, 1][id_label_index], results3d[0][:, 2][id_label_index], c=[id_clabel[i] for i in id_label_index], cmap='tab20')
+    # anim_id.save(os.path.join(save_path, f'{prefix}-3d-tsne-id-no_grid.gif'), dpi=200, writer='imagemagick')
+    # plt.clf()
+    # # back
+    # anim_back = FuncAnimation(fig,
+    #                           partial(update, ax=axe_3d, anim_save_path=anim_save_path[1]),
+    #                           frames=np.arange(0, 120),
+    #                           interval=200,
+    #                           )
+    # axe_3d.scatter3D(results3d[1][:, 0][back_label_index], results3d[1][:, 1][back_label_index], results3d[1][:, 2][back_label_index], c=[back_clabel[i] for i in back_label_index], cmap='tab20')
+    # anim_back.save(os.path.join(save_path, f'{prefix}-3d-tsne-back-no_grid.gif'), dpi=200, writer='imagemagick')
+    # plt.clf()
+    # logger.info('3d completed')
+
+
+if __name__ == '__main__':
+    visualize()

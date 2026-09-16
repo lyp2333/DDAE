@@ -1,0 +1,181 @@
+# joint training
+joint:
+  data:
+    root: "/home/lyp/Data/celeba/celeba.lmdb"
+    name: "celeba_64"
+    is_group_dataset: False
+    group_size: 4
+    image_size: 64
+    hflip: True
+    n_channels: 3
+    norm: True
+
+  model_ddpm:
+    dim: 192
+    emb_channels: 512 # should be same as encoder_out_channels
+    attn_resolutions: "8,16,32"
+    n_residual: 2
+    dim_mults: "1,2,4,8"
+    dropout: 0.1
+    n_heads: 4
+    num_head_channels: 64
+    beta1: 1e-5
+    beta2: 0.02
+    use_scale_shift_norm: True
+    n_timesteps: 1000
+    var_type: fixedlarge
+    use_z: True
+    z_dim: ${dataset.joint.model_Encoder.out_channels}
+    use_x_hat: False
+    resblock_updown: True
+    use_mappingnet: False
+    pred_mode: 'adaptive_form1' # eps, x0, adaptive_form1 or adaptive_form2
+
+  model_Encoder:
+    in_channels: 3
+    model_channels: ${dataset.joint.model_ddpm.dim}
+    out_channels: 512 # latent-code length
+    num_res_blocks: 2
+    attention_resolutions: "8,16,32"
+    dropout: 0.1
+    channel_mult: "1,2,4,8,8"
+    conv_resample: True
+    use_checkpoint: False
+    num_heads: 4
+    num_head_channels: 64
+    resblock_updown: True
+
+  training:
+    seed: 42
+    is_group_training: ${dataset.joint.data.is_group_dataset}
+    training_name: "celeba_64-diffae-adaptive_form1"
+    fp16: True
+    use_ema: True
+    use_z: ${dataset.joint.model_ddpm.use_z}
+    z_dim: ${dataset.joint.model_Encoder.out_channels}
+    type: 'form1'
+    ema_decay: 0.9999
+    batch_size: 50
+    epochs: 500
+    steps: 1_600_000
+    log_step: 10
+    device: "gpu:0"
+    chkpt_interval: 500
+    optimizer: "Adam"
+    training_lr: 1e-4
+    weight_decay: 0
+    beta_1: 0.9
+    beta_2: 0.999
+    restore_path: ""
+    results_dir: "/home/lyp/Code/adaptive_DiffuseGAE"
+    workers: 72
+    grad_clip: 1.0
+    lr_scheduler: "warmup"
+    warmup: 0
+    loss: "l2"
+    chkpt_prefix: ""
+    cfd_rate: 0.0
+    # joint-train paras
+    train_pattern: "encoder+ddpm"
+    gamma: 0 # loss weight. only > 0 in encoder+decoder+ddpm pattern and GAE training
+    lambda_eps: 1
+    lambda_x0: 1
+    lambda_adaptive_factor: 1
+    Gae_chkpt_path: ${dataset.joint.training.results_dir}/checkpoints/ilab_128-l1-norm_True-500k-new_GAE-training--checkpoints/Model_weights/last.ckpt # leave it "" when you don't want to load GAE pre-trained weights
+    diffae_chkpt_path: ${dataset.joint.training.results_dir}/checkpoints/ilab_128-diffae-form1--checkpoints/Model_weights/last.ckpt
+    # sample paras in training
+    sample_every_step: 2000
+    num_samples: 24
+    sample_storage_path: ""
+    samples_norm: False
+    sample_from: 'target'
+    resample_strategy: 'spaced'
+    skip_strategy: 'uniform'
+    sample_method: 'ddim'
+    pred_steps: 20
+GAE:
+  # todo change
+  data:
+    name: "ilab_128_group_500k_z" # same as get_latent.yaml
+    root: /home/lyp/Data/ilab/latent_code/group_latent_code-${dataset.GAE.data.name}.pth
+    is_group_dataset: True
+    group_size: 4
+    image_size: 128 # original img_size for sample in training process
+    norm: True
+  model:
+    in_channels: ${dataset.joint.model_Encoder.out_channels}
+    base_dim: 512
+    num_skip_blocks: 4
+    out_channels: ${dataset.joint.model_Encoder.out_channels}
+    repeat_num: 2 # num of residual block
+    dropout: 0.1
+    z_dim: 100
+    z_id_dim: 60
+    z_back_dim: 20
+    z_pose_dim: 20
+    diffusion_ckpt_path: ${dataset.joint.training.results_dir}/checkpoints/${dataset.joint.training.training_name}--checkpoints/Model_weights/last.ckpt # for sample in training GAE
+  training:
+    seed: 42
+    is_group_training: ${dataset.GAE.data.is_group_dataset}
+    training_name: ilab_128-${dataset.GAE.training.loss_type}-norm_${dataset.GAE.data.norm}-500k-new_GAE-training
+    fp16: False
+    batch_size: 2048
+    epochs: 4000
+    log_step: 40
+    device: "gpu:0"
+    chkpt_interval: 20
+    optimizer: "Adam"
+    loss_type: 'l1'
+    training_lr: 1e-4
+    weight_decay: 0
+    beta_1: 0.9
+    beta_2: 0.999
+    restore_path: ""
+    results_dir: "/home/lyp/Code/adaptive_DiffuseGAE"
+    workers: 128
+    lr_scheduler: 'warmup'
+    warmup: 0
+    chkpt_prefix: ""
+    cfd_rate: 0.0
+    lambda_recon: 1 # loss_Gae weight
+    lambda_combine: 0.5 # loss_Gae weight
+    lambda_unsup: 0.5 # loss_Gae weight
+    sample_every_step: 2000
+    num_samples: 8
+    sample_storage_path: ""
+    samples_norm: False
+
+classifier:
+  data:
+    name: "ilab_128_for_classify"
+    root: "/home/lyp/Data/ilab/ilab_128.lmdb"
+    z_root: ${dataset.joint.training.results_dir}/checkpoints/ilab_128-diffae-form1--checkpoints/latent_code/group_latent_code-ilab_128_group_500k_z.pth
+    image_size: 128
+    norm: True
+  model:
+    attr_to_classify: 'id'
+    eval_attr_to_classify: 'back'
+    GAE_ckpt_path: ${dataset.classifier.training.results_dir}/checkpoints/ilab_128-l1-norm_True-500k-new_GAE-training--checkpoints/Model_weights/last.ckpt # GAE training checkpoint path
+    encoder_ckpt_path: ${dataset.classifier.training.results_dir}/checkpoints/ilab_128-diffae-form1--checkpoints/Model_weights/last.ckpt # extract from diffae's encoder
+    z_norm: True
+    GSL_ckpt_path: "/home/lyp/Code/Group-Supervised-Learning/checkpoints/pretrained_models/ilab_20M.ckpt"
+  training:
+    seed: 42
+    lr: 1e-1
+    batch_size: 128
+    weight_decay: 0.01
+    train_mode: 'gsl_out'
+    training_name: ilab_128-classifier-${dataset.classifier.training.train_mode}-${dataset.classifier.model.attr_to_classify}-${dataset.classifier.model.eval_attr_to_classify}-training
+    fp16: False
+    epochs: 5000
+    log_step: 10
+    device: "gpu:0"
+    chkpt_interval: 1
+    beta_1: 0.9
+    beta_2: 0.999
+    restore_path: ""
+    results_dir: "/home/lyp/Code/adaptive_DiffuseGAE"
+    workers: 72
+    lr_scheduler: 'warmup'
+    warmup: 0
+    chkpt_prefix: ""

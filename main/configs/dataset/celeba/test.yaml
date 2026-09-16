@@ -1,0 +1,132 @@
+# joint training
+joint:
+  data:
+    root: "/home/lyp/Data/celeba/celeba.lmdb" # /path/to/manipulate(group), reconstruction(no group), visualization(no group)
+    labels_root: '/home/lyp/Data/ilab/ilab_128.lmdb/ilab_128.txt'
+    imgs_root: '/home/lyp/Code/DiffuseGAE/main/evaluation/imgs_recombination' # /path/to/images to be interpolated or recombined
+    ppl_imgs_root0: '/home/lyp/Code/DiffuseGAE/ppl_eval/folder1' # for ppl distance
+    ppl_imgs_root1: '/home/lyp/Code/DiffuseGAE/ppl_eval/folder2' # for ppl distance
+    autoencoding_imgs_root0: '/home/lyp/Code/DiffuseGAE/Recon/step_100/original'
+    autoencoding_imgs_root1: '/home/lyp/Code/DiffuseGAE/Recon/step_100/recom'
+    name: "celeba_64"
+    is_group_dataset: False
+    group_size: 4
+    image_size: 64
+    hflip: False
+    n_channels: 3
+    norm: True
+
+  model_ddpm:
+    dim: 128
+    emb_channels: 512 # should be same as encoder_out_channels
+    attn_resolutions: "16,"
+    n_residual: 2
+    dim_mults: "1,1,2,3,4"
+    dropout: 0.1
+    n_heads: 1
+    beta1: 1e-4
+    beta2: 0.02
+    use_scale_shift_norm: True
+    n_timesteps: 1000
+    var_type: fixedlarge
+    use_z: True
+    z_dim: ${dataset.joint.model_Encoder.out_channels}
+    use_x_hat: False
+    resblock_updown: True
+    use_mappingnet: False
+
+  model_Encoder:
+    in_channels: 3
+    model_channels: ${dataset.joint.model_ddpm.dim}
+    out_channels: 512 # latent-code length
+    num_res_blocks: 2
+    attention_resolutions: "16,"
+    dropout: 0.1
+    channel_mult: "1,1,2,3,4,4"
+    conv_resample: True
+    use_checkpoint: False
+    num_heads: 1
+    resblock_updown: True
+
+  evaluation: # manipulation and interpolation
+    seed: 42
+    results_dir: "/home/lyp/Code/DiffuseGAE/main/evaluation/"
+    ckpt_path: "/home/lyp/Code/DiffuseGAE/checkpoints/ilab_128-diffae-form1--checkpoints/Model_weights/last.ckpt"
+    device: "gpu:0"
+    num_samples: 50000 # num_group_s amples when is_group_dataset = True else num_samples
+    num_tsne_samples: 1000
+    num_ppl_samples: 1000
+    z_dim: 512
+    T_encode_reversed: 100 # ddim reversed steps
+    pred_steps: 100 # ddim pred steps
+    resample_strategy: "spaced"   # Whether to use spaced or truncated sampling. Use 'truncated' if sampling for the entire 1000 steps
+    skip_strategy: "uniform"   # Skipping strategy to use if `resample_strategy=spaced`. Can be ['uniform', 'quad'] as in DDIM
+    sample_method: "ddim"   # Sampling backend. Can be ['ddim', 'ddpm']
+    sample_from: "target"   # Whether to sampling from the (non)-EMA model. Can be ['source', 'target']
+    workers: 72
+    batch_size: 100   # Batch size during sampling per gpu
+    variance: "fixedlarge"
+    num_intp: 10 # num of interpolation
+    save_path: /home/lyp/Code/DiffuseGAE/manipulation/manipulation-norm_${dataset.GAE.data.norm}-${dataset.joint.evaluation.T_encode_reversed}_${dataset.joint.evaluation.pred_steps} # todo change in different eval task
+    recon_model: 'encoder_out' # (encoder_out, gae_out)
+    recon_mode: 'random' # (step, random)
+    recon_save_path: /home/lyp/Code/DiffuseGAE/Recon/${dataset.joint.evaluation.recon_model}
+    visualization_save_path: /home/lyp/Code/DiffuseGAE/Tsne_visualization/${dataset.joint.evaluation.num_tsne_samples}-${dataset.joint.evaluation.visualization_type}
+    visualization_type: "z_dis" # select in z_dis or z_original
+    visualization_save_prefix: ${dataset.joint.evaluation.num_tsne_samples}-${dataset.joint.evaluation.visualization_type}
+    ppl_evaluation_model: 'gae_out' # choose in (encoder_out, gae_out, gsl_out)
+    ppl_evaluation_mode: 'full' #(full, start)
+    use_xT: True
+    vgg16_path: "/home/ubuntu/.cache/dnnlib/downloads/2f86d6685359f59cdb0a2fab8c8f7f10_vgg16.pkl"
+    ppl_epsilon: 1e-4
+GAE:
+  # todo change
+  data:
+    name: "ilab_128_group_500k_z" # For compaibility and z_mean_std
+    is_group_dataset: True
+    norm: True # normalize or not in GAE-training process, also modify the following ckpt_path
+    root: /home/lyp/Data/Fonts/latent_code/group_latent_code-${dataset.GAE.data.name}.pth # same as hparas.yaml in GAE training
+    image_size: 128 # original img_size for sample in training process
+  model:
+    in_channels: ${dataset.joint.model_Encoder.out_channels}
+    base_dim: 512
+    num_skip_blocks: 4
+    out_channels: ${dataset.joint.model_Encoder.out_channels}
+    repeat_num: 2
+    dropout: 0.
+    loss_type: 'l1'
+    z_dim: 100
+    z_id_dim: 60
+    z_back_dim: 20
+    z_pose_dim: 20
+    ckpt_path: /home/lyp/Code/DiffuseGAE/checkpoints/ilab_128-${dataset.GAE.model.loss_type}-norm_${dataset.GAE.data.norm}-500k-new_GAE-training--checkpoints/Model_weights/last.ckpt # GAE training checkpoint path
+
+GSL:
+  data:
+    root: "/home/lyp/Data/ilab/ilab_128.lmdb" # /path/to/manipulate(group), reconstruction(no group), visualization(no group)
+    imgs_root: '/home/lyp/Code/DiffuseGAE/main/evaluation/imgs_recombination'
+    labels_root: '/home/lyp/Data/ilab/ilab_128.lmdb/ilab_128.txt'
+    name: "ilab_128"
+    is_group_dataset: False
+    group_size: 1
+    image_size: 128
+    hflip: False
+    n_channels: 3
+    norm: True
+  model:
+    nc: 3
+    g_conv_dim: 64
+    g_repeat_num: 1
+    z_dim: 100
+    z_id_dim: 60
+    z_back_dim: 20
+    z_pose_dim: 20
+  evaluation:
+    device: 'gpu:0'
+    seed: 42
+    ckpt_path: "/home/lyp/Code/Group-Supervised-Learning/checkpoints/pretrained_models/ilab_20M.ckpt"
+    batch_size: 1024
+    num_samples: 50000
+    recon_save_path: /home/lyp/Code/DiffuseGAE/Recon
+    visualization_save_path: /home/lyp/Code/DiffuseGAE/Tsne_visualization/${dataset.GSL.evaluation.num_tsne_samples}-GSL
+    num_tsne_samples: 1000
