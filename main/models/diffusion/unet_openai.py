@@ -527,6 +527,11 @@ class AttentionBlock(nn.Module):
     An attention block that allows spatial positions to attend to each other.
     Originally ported from here, but adapted to the N-d case.
     https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
+
+    Supports an optional "implicit constraint" K/V reuse mechanism (paper
+    §3.3): during DDIM inversion the block caches its self-attention
+    key/value features, and during the subsequent generation the cached
+    K/V can be re-injected to align inversion and generation trajectories.
     """
 
     def __init__(self,
@@ -549,6 +554,45 @@ class AttentionBlock(nn.Module):
         self.attention = QKVAttention()
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
+        # ---- Implicit constraint state (paper §3.3) ----
+        # `kv_cache_enabled`: when True, the block saves its K/V tensors
+        #                    into self._kv_cache on every forward call.
+        # `kv_inject_enabled`: when True, the block REPLACES the K/V
+        #                    computed from the current input with the
+        #                    cached K/V (used during generation).
+        self.kv_cache_enabled: bool = False
+        self.kv_inject_enabled: bool = False
+        self._kv_cache: dict = {}
+
+    # ---- Implicit constraint public API ----
+    def enable_kv_cache(self):
+        """Enable K/V caching (call before DDIM inversion)."""
+        self.kv_cache_enabled = True
+        self.kv_inject_enabled = False
+        self._kv_cache = {}
+
+    def enable_kv_inject(self):
+        """Enable K/V re-injection from cache (call before DDIM generation)."""
+        self.kv_inject_enabled = True
+        self.kv_cache_enabled = False
+
+    def disable_implicit_constraint(self):
+        """Reset to default behavior (no caching, no injection)."""
+        self.kv_cache_enabled = False
+        self.kv_inject_enabled = False
+        # NOTE: keep self._kv_cache populated so a subsequent
+        # enable_kv_inject() can still use the cached tensors until the
+        # next inversion pass overwrites them.
+
+    def get_cached_kv(self):
+        """Return the cached (K, V) tuple, or (None, None) if empty."""
+        if not self._kv_cache:
+            return None, None
+        # We cache a single (K, V) pair per block (stochastic encoder is
+        # deterministic under eta=0, so one pass suffices).
+        key = next(iter(self._kv_cache))
+        return self._kv_cache[key]
+
     def forward(self, x):
         return torch_checkpoint(self._forward, (x,), self.use_checkpoint)
 
@@ -557,6 +601,30 @@ class AttentionBlock(nn.Module):
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
         qkv = qkv.reshape(b * self.num_heads, -1, qkv.shape[2])
+
+        # Apply implicit-constraint K/V reuse on the QKV tensor BEFORE
+        # the standard QKVAttention module splits it. We split into
+        # (q, k, v) and then either save or replace (k, v).
+        ch = qkv.shape[1] // 3
+        q, k, v = th.split(qkv, ch, dim=1)
+
+        if self.kv_cache_enabled:
+            # Cache the freshly computed (k, v). Use a stable key per
+            # call so that successive inversion steps overwrite the same
+            # entry (only the LAST inversion step is needed for the
+            # decoder, matching the paper's "last 10% of denoising
+            # steps" recipe).
+            self._kv_cache['kv'] = (k.detach(), v.detach())
+        elif self.kv_inject_enabled and 'kv' in self._kv_cache:
+            k_cached, v_cached = self._kv_cache['kv']
+            k = k_cached.to(k.dtype)
+            v = v_cached.to(v.dtype)
+
+        # Recombine and delegate to QKVAttention using its existing
+        # public API (which already takes a [B x 3C x T] qkv tensor).
+        # We bypass QKVAttention's internal split by passing a custom
+        # path: rebuild the qkv tensor with our (possibly replaced) k, v.
+        qkv = th.cat([q, k, v], dim=1)
         h = self.attention(qkv)
         h = h.reshape(b, -1, h.shape[-1])
         h = self.proj_out(h)
@@ -992,6 +1060,46 @@ class UNetModel(nn.Module):
             zero_module(conv_nd(dims, self.model_channels, self.out_channels, 3, padding=1)),
         )
         self.norm = torch.sigmoid if self.use_adaptive else nn.Identity()
+
+    # ----------------------------------------------------------------------
+    # Implicit constraint helpers (paper §3.3)
+    # ----------------------------------------------------------------------
+    def _collect_attention_blocks(self):
+        """Return all AttentionBlock instances in the U-Net, indexed by
+        the order they are visited during a forward pass (encoder first,
+        then middle, then decoder)."""
+        attn_blocks = []
+        for module in self.input_blocks:
+            for m in module.modules():
+                if isinstance(m, AttentionBlock):
+                    attn_blocks.append(m)
+        for m in self.middle_block.modules():
+            if isinstance(m, AttentionBlock):
+                attn_blocks.append(m)
+        for module in self.output_blocks:
+            for m in module.modules():
+                if isinstance(m, AttentionBlock):
+                    attn_blocks.append(m)
+        return attn_blocks
+
+    def enable_implicit_constraint_inversion(self):
+        """Enable K/V caching on every attention block. Call before the
+        DDIM inversion pass so the encoder saves self-attention K/V
+        tensors that will be re-injected during generation."""
+        for blk in self._collect_attention_blocks():
+            blk.enable_kv_cache()
+
+    def enable_implicit_constraint_generation(self):
+        """Enable K/V re-injection on every attention block. Call before
+        the DDIM generation pass."""
+        for blk in self._collect_attention_blocks():
+            blk.enable_kv_inject()
+
+    def disable_implicit_constraint(self):
+        """Restore default attention behavior (no caching, no injection)."""
+        for blk in self._collect_attention_blocks():
+            blk.disable_implicit_constraint()
+
     @property
     def inner_dtype(self):
         """

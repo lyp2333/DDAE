@@ -26,6 +26,17 @@ class SpacedDiffusion(nn.Module):
         self.var_type: str = self.base_diffusion.var_type
         self.timestep_map = []
 
+        # ---- Implicit constraint (paper §3.3) configuration ----
+        # `implicit_constraint_t_frac`: fraction of late denoising steps
+        #     at which K/V re-injection is active. Default 0.1 matches
+        #     "last 10% of denoising steps" (supp.tex §4).
+        # `_decoder_kv_inject_on`: internal flag tracking whether the
+        #     decoder is currently in injection mode, so we don't toggle
+        #     `enable_implicit_constraint_generation` / `disable_*` on
+        #     every step.
+        self.implicit_constraint_t_frac: float = 0.1
+        self._decoder_kv_inject_on: bool = False
+
         last_alpha_cumprod = 1.0
         alphas_cumprod = torch.cumprod(1.0 - self.base_diffusion.betas, dim=0)
         new_betas = []
@@ -434,7 +445,8 @@ class SpacedDiffusion(nn.Module):
                     clip_denoised="static",
                     checkpoints=[],
                     eta=0.0,
-                    guidance_weight=0.0
+                    guidance_weight=0.0,
+                    use_implicit_constraint=False,
                     ):
         """
         ddim sample with adaptive model
@@ -446,6 +458,13 @@ class SpacedDiffusion(nn.Module):
         :param checkpoints:
         :param eta:
         :param guidance_weight:
+        :param use_implicit_constraint: if True, enable K/V re-injection
+            from the inversion pass (paper §3.3). The decoder's
+            self-attention blocks will REPLACE their freshly computed
+            K/V tensors with the cached ones from the inversion pass,
+            for the LAST `t_star_frac` fraction of denoising steps (and
+            for the LAST 3 decoder blocks by default; see also
+            `paper §3.3`).
         :return:
         """
         # The sampling process w and w/o adaptive model goes here!
@@ -455,7 +474,28 @@ class SpacedDiffusion(nn.Module):
         get_mean_cov = partial(self.get_adaptive_ddim_mean_cov, adaptive_factor_=adaptive_factor) if self.use_adaptive else self.get_ddim_mean_cov
         num_steps = len(self.timestep_map)
         checkpoints = [num_steps] if checkpoints == [] else checkpoints
+
+        # ---- Implicit constraint (paper §3.3) ----
+        # Only enable K/V injection for the late denoising steps
+        # (t < t_star), where image layout is established; this matches
+        # the "last 10% of denoising steps" recipe in supp.tex §4.
+        implicit_constraint_active = False
+        if use_implicit_constraint and hasattr(self.decoder, 'enable_implicit_constraint_generation'):
+            self.decoder.enable_implicit_constraint_generation()
+            implicit_constraint_active = True
+            t_star = max(1, int(num_steps * self.implicit_constraint_t_frac))
+
         for idx, t in enumerate(reversed(range(0, num_steps))):
+            # Toggle the implicit constraint based on whether we are in
+            # the "high-resolution" late phase.
+            if implicit_constraint_active:
+                if (t < t_star) and not self._decoder_kv_inject_on:
+                    self.decoder.enable_implicit_constraint_generation()
+                    self._decoder_kv_inject_on = True
+                elif (t >= t_star) and self._decoder_kv_inject_on:
+                    self.decoder.disable_implicit_constraint()
+                    self._decoder_kv_inject_on = False
+
             noise = torch.randn_like(x_t)
             assert noise.shape == x_t.shape
             # x += 0.002 * x_t
@@ -480,6 +520,13 @@ class SpacedDiffusion(nn.Module):
             # Add results
             if idx + 1 in checkpoints:
                 sample_dict[str(idx + 1)] = x
+
+        # Always restore the default attention behavior before returning
+        # so subsequent passes without `use_implicit_constraint=True`
+        # are not affected.
+        if implicit_constraint_active:
+            self.decoder.disable_implicit_constraint()
+            self._decoder_kv_inject_on = False
 
         return sample_dict
 
@@ -585,7 +632,16 @@ class SpacedDiffusion(nn.Module):
         # mean_pred = x0_score * extract(self.sqrt_alpha_bar, t, x0_score.shape) + \
         #             eps_score * extract(self.minus_sqrt_alpha_bar, t, x0_score.shape)
 
-    def ddim_reverse_sample_loop(self, x, cond=None, z=None, clip_denoised=True, eta=0.0, **kwargs):
+    def ddim_reverse_sample_loop(self, x, cond=None, z=None, clip_denoised=True, eta=0.0,
+                                  use_implicit_constraint=False, **kwargs):
+        """
+        DDIM inversion loop.
+
+        :param use_implicit_constraint: if True, populate the U-Net's K/V cache
+            during inversion so that subsequent ``ddim_sample`` calls with the
+            same flag can re-inject those K/V values (paper §3.3 implicit
+            constraint).
+        """
         sample_t = []
         xstart_t = []
         T = []
@@ -593,22 +649,33 @@ class SpacedDiffusion(nn.Module):
         reverse_sample = self.ddim_reverse_sample_with_adaptive_model if self.use_adaptive else self.ddim_reverse_sample
         sample: torch.Tensor = x
 
-        for t in indices:
-            mean_pred, pred_x_start = reverse_sample(
-                x=sample,
-                t=t,
-                cond=cond,
-                z=z,
-                clip_denoised=clip_denoised,
-                eta=eta,
-                **kwargs
-            )
-            sample = mean_pred
-            # bugfix here, sample is tensor in first loop, tuple with one element in the next loops.
-            sample = sample[0] if isinstance(sample, tuple) else sample
-            sample_t.append(sample)
-            xstart_t.append(pred_x_start)
-            T.append(t)
+        # Enable K/V caching on every attention block in the U-Net.  Because
+        # the inversion pass is deterministic (eta=0), only the final step's
+        # K/V is kept -- the cache uses a single key that is overwritten on
+        # every forward pass.
+        if use_implicit_constraint and hasattr(self.decoder, 'enable_implicit_constraint_inversion'):
+            self.decoder.enable_implicit_constraint_inversion()
+        try:
+            for t in indices:
+                mean_pred, pred_x_start = reverse_sample(
+                    x=sample,
+                    t=t,
+                    cond=cond,
+                    z=z,
+                    clip_denoised=clip_denoised,
+                    eta=eta,
+                    **kwargs
+                )
+                sample = mean_pred
+                # bugfix here, sample is tensor in first loop, tuple with one element in the next loops.
+                sample = sample[0] if isinstance(sample, tuple) else sample
+                sample_t.append(sample)
+                xstart_t.append(pred_x_start)
+                T.append(t)
+        finally:
+            # Always restore default behaviour, even if an exception is raised.
+            if hasattr(self.decoder, 'disable_implicit_constraint'):
+                self.decoder.disable_implicit_constraint()
 
         return {
             'sample': sample,

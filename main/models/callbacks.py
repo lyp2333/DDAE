@@ -415,6 +415,23 @@ class LogSample(Callback):
                 guidance_weight=0.,
             )[str(model.pred_steps)]
 
+            # ---- "w/ implicit constraint" reconstruction (paper Table 1) ----
+            x_t_con = model.spaced_diffusion.ddim_reverse_sample_loop(
+                x=img,
+                cond=cond,
+                z=z,
+                eta=0.,
+                use_implicit_constraint=True,
+            )['sample']
+            ddim_recon_con = model.spaced_diffusion.ddim_sample(
+                x_t=x_t_con,
+                cond=cond,
+                z=z,
+                eta=0.,
+                guidance_weight=0.,
+                use_implicit_constraint=True,
+            )[str(model.pred_steps)]
+
             # x_T sample from N~(0, I)
             x_t = torch.randn(x_t.shape, device=x_t.device)
             ddim_recon_randn = model.spaced_diffusion.ddim_sample(
@@ -424,7 +441,7 @@ class LogSample(Callback):
                 eta=0.,
                 guidance_weight=0.,
             )[str(model.pred_steps)]
-            return ddim_recon, ddim_recon_randn, img
+            return ddim_recon, ddim_recon_randn, img, ddim_recon_con
         else:
             raise NotImplemented(f'callback for {model.train_pattern} is not implemented')
 
